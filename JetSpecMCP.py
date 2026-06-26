@@ -3,19 +3,6 @@ VGB: Value-Guided Sampling with Stochastic Backtracking
 Reimplementation of: "Taming Imperfect Process Verifiers:
 A Sampling Perspective on Backtracking" (Rohatgi et al., 2025)
 
-Fixes over the previous MCP server:
-  1. Theorem-aware step count T computed from ε_V, H, δ (Thm 4.1 / 4.2)
-  2. ε_V estimation and assumption verification (Assumption 4.1 / 4.2)
-  3. VGB-Momentum (Hayes & Sinclair 2010) — Appendix E.1
-  4. Chat-template support for instruct-tuned local models
-  5. Auto-fallback to sampled candidate mode when API lacks logprobs
-  6. Token-accurate remaining-token estimation via tokenizer
-  7. Separate (small) verifier model option — keeps large base models usable
-  8. Default value_type="tilt" for true plug-and-play (Section 5.3)
-  9. KL-regularized value via Q̂ (Algorithm 2)
- 10. Ground-truth τ at leaves (Algorithm 1, Line 1)
- 11. Bug fixes: _default_config shadowing, run_theoretical attempt leak,
-     OutcomeLevelRS completion check, tree-walk during mutation
 """
 
 import os
