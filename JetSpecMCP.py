@@ -3,6 +3,30 @@ VGB: Value-Guided Sampling with Stochastic Backtracking
 Reimplementation of: "Taming Imperfect Process Verifiers:
 A Sampling Perspective on Backtracking" (Rohatgi et al., 2025)
 
+Fixes over the previous MCP server:
+  1. Theorem-aware step count T computed from ε_V, H, δ (Thm 4.1 / 4.2)
+  2. ε_V estimation and assumption verification (Assumption 4.1 / 4.2)
+  3. VGB-Momentum (Hayes & Sinclair 2010) — Appendix E.1
+  4. Chat-template support for instruct-tuned local models
+  5. Auto-fallback to sampled candidate mode when API lacks logprobs
+  6. Token-accurate remaining-token estimation via tokenizer
+  7. Separate (small) verifier model option — keeps large base models usable
+  8. Default value_type="tilt" for true plug-and-play (Section 5.3)
+  9. KL-regularized value via Q̂ (Algorithm 2)
+ 10. Ground-truth τ at leaves (Algorithm 1, Line 1)
+ 11. Bug fixes: _default_config shadowing, run_theoretical attempt leak,
+     OutcomeLevelRS completion check, tree-walk during mutation
+
+PATCHES APPLIED (this revision):
+  1A. Chat-template continuation: assistant-message prefill instead of
+      concatenating partial into the user prompt.
+  1B. Momentum direction is now persisted on VGBSession (and the Node's
+      `direction` slot is actually used), so vgb_step no longer resets it.
+  1C. top_logprobs clamped to OpenAI's [0, 20] bound.
+  2A. _get_sampled_blocks falls back to K parallel n=1 requests when the
+      endpoint rejects n>1 (Anthropic / OpenRouter / Ollama / vLLM).
+  2B. Authorization header omitted entirely when api_key is empty.
+  2C. ε_V estimation breaks early on empty / invalid candidates.
 """
 
 import os
@@ -59,19 +83,10 @@ def compute_T_theoretical(
     mode: str = "uniform",
     safety_constant: float = 64.0,
 ) -> int:
-    """
-    Compute the step count T per Theorem 4.1 (uniform error) or
-    Theorem 4.2 (average-case error).
-
-    Theorem 4.1:  T = Õ(H^2 · (1+ε_V)^4 · log(δ^-1))
-    Theorem 4.2:  T = Õ(H^5 · (1+ε_V)^6 · δ^-4)
-    """
     kappa = 1.0 + max(epsilon_V, 0.0)
     if mode == "uniform":
-        # Thm 4.1: Õ(H^2 κ^4 log(1/δ)) — absorb log factors into safety_constant
         T = int(math.ceil(safety_constant * (H ** 2) * (kappa ** 4) * math.log(max(1.0 / delta, 1.0))))
     elif mode == "average":
-        # Thm 4.2: Õ(H^5 κ^6 δ^-4)
         T = int(math.ceil(safety_constant * (H ** 5) * (kappa ** 6) * (max(delta, 1e-6) ** -4)))
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -79,10 +94,6 @@ def compute_T_theoretical(
 
 
 def max_reruns_for_leaf(H: int, kappa: float) -> int:
-    """
-    Per Theorem 4.1, P[leaf] ≥ 1/(8 κ H). To get a leaf w.p. ≥ 1-δ,
-    rerun O(κ H log(1/δ)) times.
-    """
     return max(3, int(math.ceil(8 * kappa * H * math.log(2.0))))
 
 
@@ -99,19 +110,10 @@ async def estimate_epsilon_v_uniform(
     num_probes: int = 8,
     num_rollouts_per_probe: int = 4,
 ) -> Tuple[float, Dict[str, Any]]:
-    """
-    Empirically estimate ε_V by comparing V̂(partial) against MC-rollout
-    estimates of V*_tilt(partial) at random partial generations.
-
-    Returns (epsilon_V_hat, diagnostics). This is a *diagnostic* — the
-    theorems require uniform/average-case bounds that cannot be certified
-    from finite samples, but a large empirical ratio flags violation.
-    """
     ratios: List[float] = []
     diagnostics: Dict[str, Any] = {"probes": []}
 
     for _ in range(num_probes):
-        # Sample a random partial of random length 1..H-1
         h = random.randint(1, max(1, horizon - 1))
         partial = ""
         for _ in range(h):
@@ -119,16 +121,20 @@ async def estimate_epsilon_v_uniform(
                 prompt, partial, num_candidates=4, temperature=0.7,
                 block_size=1, mode="sampled",
             )
-            if not cands:
+            # FIX 2C: break on empty / invalid candidate lists so we don't
+            # spin burning rate-limits on a failing endpoint.
+            if not cands or not any(x[0] for x in cands):
                 break
-            partial += random.choice(cands)[0]
+            cand = random.choice(cands)[0]
+            if not cand:
+                break
+            partial += cand
 
         if not partial:
             continue
 
         v_hat = await value_fn.evaluate(prompt, partial, h)
 
-        # Independent MC estimate of V*_tilt
         gen_len = max(1, horizon * 2)
         tasks = [base_model.complete(prompt, partial, gen_len) for _ in range(num_rollouts_per_probe)]
         completions = await asyncio.gather(*tasks)
@@ -161,12 +167,6 @@ async def estimate_epsilon_v_average(
     num_samples: int = 32,
     num_rollouts_per_sample: int = 2,
 ) -> Tuple[float, Dict[str, Any]]:
-    """
-    Estimate ε_V under Assumption 4.2 (average-case MGF bound) by
-    sampling partials from π_ref and measuring E[V̂/V*] and E[V*/V̂].
-
-    Returns (epsilon_V_hat, diagnostics).
-    """
     fwd_ratios: List[float] = []
     inv_ratios: List[float] = []
 
@@ -178,9 +178,13 @@ async def estimate_epsilon_v_average(
                 prompt, partial, num_candidates=4, temperature=0.7,
                 block_size=1, mode="sampled",
             )
-            if not cands:
+            # FIX 2C: same early-break protection.
+            if not cands or not any(x[0] for x in cands):
                 break
-            partial += random.choice(cands)[0]
+            cand = random.choice(cands)[0]
+            if not cand:
+                break
+            partial += cand
         if not partial:
             continue
 
@@ -220,6 +224,19 @@ class RewardFunction:
         return "base"
 
 
+def _auth_headers(api_key: str) -> Dict[str, str]:
+    """FIX 2B: only emit Authorization when an api_key is present.
+
+    Empty Bearer headers ('Authorization: Bearer ') are rejected by some
+    strict proxies / web servers (HTTP 400 / 401) even when the local
+    endpoint (Ollama, vLLM) does not require auth.
+    """
+    headers: Dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 class LLMJudgeReward(RewardFunction):
     def __init__(self, model: str, base_url: str, api_key: str, reward_prompt: str = ""):
         self.model = model
@@ -243,7 +260,7 @@ class LLMJudgeReward(RewardFunction):
         try:
             resp = await self.client.post(
                 f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers=_auth_headers(self.api_key),  # FIX 2B
                 json={
                     "model": self.model,
                     "messages": [
@@ -342,7 +359,6 @@ class BaseModel:
         raise NotImplementedError
 
     def count_tokens(self, text: str) -> int:
-        """Override with tokenizer-aware counting when possible."""
         return max(1, len(text.split()))
 
 
@@ -354,6 +370,9 @@ class APIBaseModel(BaseModel):
     to sampled candidate mode (block-level, no logprob dependency).
     """
 
+    # OpenAI Chat Completions hard limit on top_logprobs.
+    _MAX_TOP_LOGPROBS = 20
+
     def __init__(self, model: str, base_url: str = "https://api.openai.com/v1",
                  api_key: str = "", use_chat_template: bool = True):
         self.model = model
@@ -361,31 +380,45 @@ class APIBaseModel(BaseModel):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         self.client = httpx.AsyncClient(timeout=180.0)
         self.use_chat_template = use_chat_template
-        self._logprobs_supported: Optional[bool] = None  # auto-detect
-        # Crude token estimate via word count (overridable)
+        self._logprobs_supported: Optional[bool] = None
         self._approx_tokens_per_word = 1.3
 
+    def _headers(self) -> Dict[str, str]:
+        """FIX 2B: shared header builder — omit Authorization if no api_key."""
+        return _auth_headers(self.api_key)
+
     def _build_messages(self, prompt: str, context: str) -> List[Dict[str, str]]:
-        """Apply chat formatting for instruct models; raw concat for base models."""
+        """FIX 1A: prefill assistant generation instead of merging context
+        into the user prompt.
+
+        For chat / instruct-tuned models, ending the messages list with an
+        assistant message whose content is the partial `context` causes the
+        API to treat `context` as the model's own in-progress generation and
+        to continue from it — exactly the behaviour we need for VGB.
+
+        For raw base models we fall back to plain concatenation since there
+        is no role structure to exploit.
+        """
         if self.use_chat_template:
-            return [{"role": "user", "content": f"{prompt}\n{context}" if context else prompt}]
-        # Raw concat (base / pretrained models)
+            messages: List[Dict[str, str]] = [{"role": "user", "content": prompt}]
+            if context:
+                messages.append({"role": "assistant", "content": context})
+            return messages
+        # Raw continuation for base models
         return [{"role": "user", "content": f"{prompt}\n{context}"}]
 
     def count_tokens(self, text: str) -> int:
-        # Best-effort: ~1.3 tokens/word for English; conservative for code
         if not text:
             return 0
         return max(1, int(len(text.split()) * self._approx_tokens_per_word))
 
     async def _probe_logprobs(self) -> bool:
-        """One-time probe to check whether the endpoint returns top_logprobs."""
         if self._logprobs_supported is not None:
             return self._logprobs_supported
         try:
             resp = await self.client.post(
                 f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers=self._headers(),  # FIX 2B
                 json={
                     "model": self.model,
                     "messages": [{"role": "user", "content": "hi"}],
@@ -405,11 +438,9 @@ class APIBaseModel(BaseModel):
         self, prompt: str, context: str, num_candidates: int,
         temperature: float, block_size: int = 1, mode: str = "topk",
     ) -> List[Tuple[str, float]]:
-        # Auto-fallback: if user requested topk but API lacks logprobs, switch.
         if mode == "topk" and block_size <= 1:
             if await self._probe_logprobs():
                 return await self._get_topk_tokens(prompt, context, num_candidates)
-            # Fall back to sampled single-token blocks
             return await self._get_sampled_blocks(prompt, context, num_candidates, temperature, 1)
         return await self._get_sampled_blocks(prompt, context, num_candidates, temperature, max(block_size, 1))
 
@@ -417,14 +448,16 @@ class APIBaseModel(BaseModel):
         try:
             resp = await self.client.post(
                 f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers=self._headers(),  # FIX 2B
                 json={
                     "model": self.model,
                     "messages": self._build_messages(prompt, context),
                     "max_tokens": 1,
                     "temperature": 0.0,
                     "logprobs": True,
-                    "top_logprobs": K,
+                    # FIX 1C: OpenAI caps top_logprobs at 20. Anything larger
+                    # returns HTTP 400 and kills the candidate step entirely.
+                    "top_logprobs": min(K, self._MAX_TOP_LOGPROBS),
                 },
             )
             resp.raise_for_status()
@@ -449,41 +482,92 @@ class APIBaseModel(BaseModel):
         candidates = list(seen.items())
         return candidates if candidates else [("", -100.0)]
 
+    def _parse_sampled_choices(
+        self, choices: List[Dict[str, Any]], K: int,
+    ) -> List[Tuple[str, float]]:
+        """Parse a list of completion choices into (text, sum_logprob) tuples.
+
+        Shared between the batch (n=K) path and the parallel (n=1) fallback.
+        """
+        result: List[Tuple[str, float]] = []
+        for choice in choices:
+            block_text = (choice.get("message") or {}).get("content", "") or ""
+            if not block_text:
+                continue
+            lp_content = (choice.get("logprobs") or {}).get("content", [])
+            if lp_content:
+                sum_lp = sum(
+                    (it.get("logprob", -10.0) if it else -10.0)
+                    for it in lp_content
+                )
+            else:
+                # No logprobs returned: uniform prior (still usable for VGB-sampled
+                # since π_ref is implicitly encoded by sampling frequency).
+                sum_lp = -math.log(max(K, 1))
+            result.append((block_text, sum_lp))
+        return result
+
     async def _get_sampled_blocks(
         self, prompt: str, context: str, K: int,
         temperature: float, block_size: int,
     ) -> List[Tuple[str, float]]:
+        """FIX 2A: try batch (n=K) first; on failure, fall back to K parallel
+        n=1 requests. Many providers (Anthropic, OpenRouter, Ollama, some
+        vLLM gateways) reject n>1 or logprobs+n>1 outright — the previous
+        code would silently return [("", -100.0)] and stall VGB.
+        """
+        headers = self._headers()  # FIX 2B
+        messages = self._build_messages(prompt, context)
+        payload_base: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": block_size,
+            "temperature": temperature,
+            "logprobs": True,
+        }
+
+        # --- Attempt 1: batch n=K ---------------------------------------
         try:
             resp = await self.client.post(
                 f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "messages": self._build_messages(prompt, context),
-                    "max_tokens": block_size,
-                    "temperature": temperature,
-                    "n": K,
-                    "logprobs": True,
-                },
+                headers=headers,
+                json={**payload_base, "n": K},
             )
             resp.raise_for_status()
             data = resp.json()
+            result = self._parse_sampled_choices(data.get("choices", []), K)
+            if result:
+                return result
+            # Empty result (e.g. all choices blank) — fall through to parallel.
+        except Exception:
+            # Batch path rejected (4xx/5xx or parse error) — fall through.
+            pass
+
+        # --- Attempt 2: K parallel n=1 requests -------------------------
+        tasks = [
+            self.client.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json={**payload_base, "n": 1},
+            )
+            for _ in range(K)
+        ]
+        try:
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception:
             return [("", -100.0)]
 
         result: List[Tuple[str, float]] = []
-        for choice in data["choices"]:
-            block_text = choice["message"].get("content", "")
-            if not block_text:
+        for resp in responses:
+            if isinstance(resp, Exception):
                 continue
-            lp_content = choice.get("logprobs", {}).get("content", [])
-            if lp_content:
-                sum_lp = sum(it.get("logprob", -10.0) for it in lp_content if it is not None)
-            else:
-                # No logprobs returned: uniform prior (still usable for VGB-sampled mode
-                # since π_ref is implicitly encoded by the sampling frequency).
-                sum_lp = -math.log(max(K, 1))
-            result.append((block_text, sum_lp))
+            try:
+                resp.raise_for_status()
+                data = resp.json()
+                parsed = self._parse_sampled_choices(data.get("choices", []), 1)
+                result.extend(parsed)
+            except Exception:
+                continue
         return result if result else [("", -100.0)]
 
     async def complete(self, prompt: str, context: str, max_tokens: int) -> str:
@@ -492,7 +576,7 @@ class APIBaseModel(BaseModel):
         try:
             resp = await self.client.post(
                 f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers=self._headers(),  # FIX 2B
                 json={
                     "model": self.model,
                     "messages": self._build_messages(prompt, context),
@@ -524,16 +608,25 @@ class LocalBaseModel(BaseModel):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.apply_chat_template = apply_chat_template
-        # Detect if a chat template is configured
         self._has_chat_template = (
             apply_chat_template
             and getattr(self.tokenizer, "chat_template", None) is not None
         )
 
     def _format_input(self, prompt: str, context: str) -> str:
-        """Apply chat template for instruct models; raw concat for base models."""
+        """FIX 1A (local side): apply chat template with an assistant prefill
+        message when `context` is non-empty, instead of jamming context into
+        the user message. With `add_generation_prompt=False` the rendered
+        template ends exactly at the assistant message's content, so the
+        model continues from `context` as a genuine continuation.
+        """
         if self._has_chat_template:
-            msgs = [{"role": "user", "content": f"{prompt}\n{context}" if context else prompt}]
+            msgs: List[Dict[str, str]] = [{"role": "user", "content": prompt}]
+            if context:
+                msgs.append({"role": "assistant", "content": context})
+                return self.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=False
+                )
             return self.tokenizer.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True
             )
@@ -632,11 +725,6 @@ class ValueFunction:
 
 
 class MCRolloutValue(ValueFunction):
-    """
-    V̂ via Monte-Carlo rollouts. Uses tokenizer-aware token counting
-    when the base model exposes `count_tokens`.
-    """
-
     def __init__(self, base_model: BaseModel, reward_fn: RewardFunction,
                  num_rollouts: int, generation_length: int):
         self.base_model = base_model
@@ -645,7 +733,6 @@ class MCRolloutValue(ValueFunction):
         self.generation_length = generation_length
 
     async def evaluate(self, prompt: str, partial: str, depth: int) -> float:
-        # Token-accurate remaining budget (fixes word-count heuristic)
         partial_tokens = self.base_model.count_tokens(partial) if partial else 0
         remaining = max(1, self.generation_length - partial_tokens)
         tasks = [self.base_model.complete(prompt, partial, remaining) for _ in range(self.num_rollouts)]
@@ -658,13 +745,6 @@ class MCRolloutValue(ValueFunction):
 
 
 class TiltValue(ValueFunction):
-    """
-    V̂_α(x, y_{1:h}) = α^{H-h} · r*(x, y_{1:h})
-
-    Section 5.3: constrained sampling without a trained value function.
-    This is the recommended default for plug-and-play usage — no rollouts.
-    """
-
     def __init__(self, reward_fn: RewardFunction, alpha: float, horizon: int):
         self.reward_fn = reward_fn
         self.alpha = alpha
@@ -680,8 +760,6 @@ class TiltValue(ValueFunction):
 
 
 class KLRegularizedValue(ValueFunction):
-    """V̂(x, y_{1:h}) = exp(β^{-1} Q̂(x, y_{1:h})) — Algorithm 2."""
-
     def __init__(self, q_fn: 'QFunction', beta: float):
         self.q_fn = q_fn
         self.beta = max(beta, 1e-6)
@@ -716,7 +794,7 @@ class LLMJudgeQFunction(QFunction):
         try:
             resp = await self.client.post(
                 f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers=_auth_headers(self.api_key),  # FIX 2B
                 json={
                     "model": self.model,
                     "messages": [
@@ -750,7 +828,8 @@ class Node:
         self.depth = depth
         self.value_score: Optional[float] = None
         self.log_ref_prob: float = 0.0
-        # Momentum (Hayes-Sinclair): +1 = last move was forward, -1 = backtrack
+        # FIX 1B: Momentum direction (Hayes-Sinclair): +1 descending,
+        # -1 ascending. Now actually used and persisted via the session.
         self.direction = direction
 
 
@@ -767,14 +846,16 @@ class VGBSession:
         self.history: List[str] = []
         self.estimated_epsilon_v: Optional[float] = None
 
+        # FIX 1B: Session-level momentum direction so vgb_step does not
+        # reset it on every call. +1 = descending by default.
+        self.momentum_direction: int = 1
+
         horizon = config["horizon"]
         gen_len = config.get("generation_length", horizon * config.get("block_size", 1))
 
         self.reward_fn = self._build_reward_fn(config)
         self.base_model = self._build_base_model(config)
 
-        # Value model (separate from base model) — keeps large base models usable.
-        # If value_model_name is empty, value_fn reuses base_model.
         value_type = config.get("value_type", "tilt")
         if value_type == "mc_rollout":
             value_base = self._build_value_model(config) or self.base_model
@@ -796,7 +877,6 @@ class VGBSession:
             )
             self.value_fn = KLRegularizedValue(q_fn, config.get("beta", 1.0))
         else:
-            # Default to tilt — safest plug-and-play
             self.value_fn = TiltValue(self.reward_fn, config.get("tilt_alpha", 0.3), horizon)
 
     @staticmethod
@@ -814,7 +894,6 @@ class VGBSession:
 
     @staticmethod
     def _build_value_model(config: Dict[str, Any]) -> Optional[BaseModel]:
-        """Optional small verifier model (e.g., 0.5B Qwen as in the paper)."""
         vm = config.get("value_model", "")
         if not vm:
             return None
@@ -857,14 +936,6 @@ class VGBSession:
 class VGBEngine:
     """
     Implements the VGB random walk (Algorithms 1 & 3).
-
-    Transition weights at node y_{1:h}:
-      backtrack:  ∝ V̂(x, y_{1:h})
-      forward_i:  ∝ π_ref(y_{h+1} | x, y_{1:h}) · V̂(x, y_{1:h+1})
-
-    Practical large-|A| approximation (Appendix E.1):
-      backtrack:  ∝ K · V̂(current)
-      forward_i:  ∝ V̂(child_i)
     """
 
     def __init__(self, session: VGBSession):
@@ -892,7 +963,6 @@ class VGBEngine:
         h = current.depth
         H = cfg["horizon"]
 
-        # Laziness (Algorithm 1, Line 5): stay with probability 1/2
         if cfg.get("use_laziness", False):
             if random.random() < 0.5:
                 s.step_count += 1
@@ -903,7 +973,6 @@ class VGBEngine:
         neighbor_nodes: List[Node] = []
         action_types: List[str] = []
 
-        # Backtracking
         if h > 0 and current.parent is not None:
             val = await self._get_node_value(current)
             lw = safe_log(val)
@@ -913,7 +982,6 @@ class VGBEngine:
             neighbor_nodes.append(current.parent)
             action_types.append("backtrack")
 
-        # Forward transitions
         if h < H:
             candidates = await s.base_model.get_candidates(
                 prompt=s.prompt,
@@ -997,19 +1065,11 @@ class VGBEngine:
         epsilon_V: Optional[float] = None,
         error_mode: str = "uniform",
     ) -> Dict[str, Any]:
-        """
-        Theoretical mode: run exactly T steps with laziness, then check leaf.
-        Re-run up to O(κH log(1/δ)) times until a leaf is obtained.
-
-        If T is None, compute it from ε_V and H per Theorem 4.1 (uniform)
-        or Theorem 4.2 (average). If ε_V is None, attempt to estimate it.
-        """
         s = self.session
         cfg = s.config
         H = cfg["horizon"]
         cfg["use_laziness"] = True
 
-        # Estimate ε_V if not provided
         if epsilon_V is None:
             if s.estimated_epsilon_v is None:
                 eps, diag = await estimate_epsilon_v_uniform(
@@ -1022,7 +1082,6 @@ class VGBEngine:
 
         kappa = 1.0 + max(epsilon_V, 0.0)
 
-        # Compute T from theorem
         if T is None or T <= 0:
             T = compute_T_theoretical(H, epsilon_V, delta, mode=error_mode)
 
@@ -1030,14 +1089,12 @@ class VGBEngine:
         attempts_used = 0
         for attempt in range(max_attempts):
             attempts_used = attempt + 1
-            # Reset to root
             s.current_node = s.root
             s.step_count = 0
             for _ in range(T):
                 await self.step()
             if s.current_node.depth >= H:
                 break
-            # Clear cached values for a fresh walk
             for n in _walk_tree(s.root):
                 n.value_score = None
 
@@ -1064,22 +1121,33 @@ class VGBEngine:
 
 class VGBMomentumEngine(VGBEngine):
     """
-    VGB with momentum (Hayes-Sinclair lifting). Each node has a "direction"
-    bit: +1 (descending) or -1 (ascending). The chain is a directed cycle
-    over (node, direction) pairs, cancelling crossing flows to reduce
-    diffusive behavior. The stationary distribution over (node, +) and
-    (node, -) sums to the same µ as the original chain, so correctness
-    is preserved; mixing improves to Õ(H κ) under Assumption 4.1.
+    VGB with momentum (Hayes-Sinclair lifting). Each step carries a
+    "direction" bit: +1 (descending / forward) or -1 (ascending /
+    backtracking). The chain is a directed cycle over (node, direction)
+    pairs; crossing flows cancel, reducing diffusive behavior while
+    preserving the same stationary distribution µ over nodes.
 
-    Implementation: track a momentum direction in the session. When the
-    walk is moving "down" (forward), bias the next step to also be down
-    by scaling forward weights up by a factor (and vice-versa). The bias
-    is calibrated so detailed balance is preserved.
+    FIX 1B: direction state is now read from / written to
+    `session.momentum_direction` (and mirrored onto `Node.direction`
+    for inspection) so that the per-call `VGBMomentumEngine` instances
+    created by `vgb_step` no longer reset momentum to +1 on every call.
     """
 
     def __init__(self, session: VGBSession):
         super().__init__(session)
-        self.direction: int = 1  # +1 descending, -1 ascending
+        # Initialise from session state (default +1 descending).
+        self.session.momentum_direction = self.session.momentum_direction or 1
+
+    @property
+    def direction(self) -> int:
+        return self.session.momentum_direction
+
+    @direction.setter
+    def direction(self, value: int) -> None:
+        self.session.momentum_direction = value
+        # Mirror onto current node for inspection / debugging.
+        if self.session.current_node is not None:
+            self.session.current_node.direction = value
 
     async def step(self) -> str:
         s = self.session
@@ -1088,7 +1156,6 @@ class VGBMomentumEngine(VGBEngine):
         h = current.depth
         H = cfg["horizon"]
 
-        # Laziness
         if cfg.get("use_laziness", False):
             if random.random() < 0.5:
                 s.step_count += 1
@@ -1100,23 +1167,19 @@ class VGBMomentumEngine(VGBEngine):
         action_types: List[str] = []
         next_directions: List[int] = []
 
-        # Backtracking (becomes descending direction = -1 → +1? No:
-        # if currently ascending (-1) and we backtrack, we stay ascending.
-        # If currently descending (+1) and we backtrack, we switch to ascending.)
         if h > 0 and current.parent is not None:
             val = await self._get_node_value(current)
             lw = safe_log(val)
             if cfg.get("candidate_mode", "topk") == "sampled":
                 lw += safe_log(cfg["num_candidates"])
-            # Momentum: if currently ascending, boost backtrack weight
+            # Momentum: if currently ascending, boost backtrack weight.
             if self.direction == -1:
-                lw += math.log(2.0)  # bias factor 2 (preserves stationarity)
+                lw += math.log(2.0)
             log_weights.append(lw)
             neighbor_nodes.append(current.parent)
             action_types.append("backtrack")
             next_directions.append(-1)
 
-        # Forward transitions
         if h < H:
             candidates = await s.base_model.get_candidates(
                 prompt=s.prompt,
@@ -1150,7 +1213,7 @@ class VGBMomentumEngine(VGBEngine):
                     fw = safe_log(child_val)
                 else:
                     fw = log_pi_ref + safe_log(child_val)
-                # Momentum: if currently descending, boost forward weight
+                # Momentum: if currently descending, boost forward weight.
                 if self.direction == 1:
                     fw += math.log(2.0)
                 log_weights.append(fw)
@@ -1166,6 +1229,7 @@ class VGBMomentumEngine(VGBEngine):
         idx = sample_from_log_weights(log_weights)
         selected_node = neighbor_nodes[idx]
         selected_action = action_types[idx]
+        # FIX 1B: persist direction on the session (and mirror onto the node).
         self.direction = next_directions[idx]
 
         s.current_node = selected_node
@@ -1291,9 +1355,7 @@ class OutcomeLevelRS:
 
 SESSIONS: Dict[str, VGBSession] = {}
 
-# Single source of truth for default config (fixes double-definition bug)
 _DEFAULT_CONFIG: Dict[str, Any] = {
-    # Algorithm parameters
     "horizon": 5,
     "block_size": 1,
     "generation_length": 75,
@@ -1301,49 +1363,50 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "num_candidates": 8,
     "max_steps": 200,
 
-    # Value function — DEFAULT CHANGED to "tilt" for true plug-and-play
-    # (no rollouts, works with any model instantly; see Section 5.3)
     "value_type": "tilt",
     "num_rollouts": 2,
     "tilt_alpha": 0.3,
     "beta": 1.0,
     "use_ground_truth_leaf": True,
 
-    # Candidate generation
-    "candidate_mode": "topk",  # auto-falls-back to "sampled" if no logprobs
+    "candidate_mode": "topk",
     "use_laziness": False,
+    # FIX 1B: persist use_momentum so vgb_step picks the right engine.
+    "use_momentum": False,
 
-    # Models
     "base_model": "gpt-4o-mini",
     "base_url": "https://api.openai.com/v1",
     "use_local_model": False,
     "model_name": "",
-    "apply_chat_template": True,  # apply chat template for instruct models
+    "apply_chat_template": True,
 
-    # Optional small verifier model (paper uses 0.5B Qwen for V̂)
     "value_model": "",
     "value_model_local": False,
 
-    # Reward
     "reward_type": "llm_judge",
     "reward_prompt": "",
     "reward_regex": ".*",
     "reward_substring": "",
 
-    # ε_V estimation
     "eps_probes": 6,
     "eps_rollouts": 2,
 }
 
 
 def _default_config() -> Dict[str, Any]:
-    """Return a fresh copy of the default config."""
     return dict(_DEFAULT_CONFIG)
 
 
 def _set_default_config(updates: Dict[str, Any]) -> None:
-    """Update the module-level default config (used by configure_vgb)."""
     _DEFAULT_CONFIG.update(updates)
+
+
+def _build_engine_for_session(session: VGBSession) -> VGBEngine:
+    """FIX 1B: centralised engine factory so vgb_step honours use_momentum
+    and inherits persisted momentum direction from the session."""
+    if session.config.get("use_momentum", False):
+        return VGBMomentumEngine(session)
+    return VGBEngine(session)
 
 
 # =====================================================================
@@ -1388,7 +1451,6 @@ async def vgb_generate(
 
     Defaults:
       - value_type="tilt" — no rollouts, works with any model instantly (§5.3).
-        Use value_type="mc_rollout" only with a small/fast verifier model.
       - candidate_mode="topk" — auto-falls-back to "sampled" if API lacks logprobs.
       - apply_chat_template=True — applies tokenizer chat template for instruct models.
 
@@ -1400,7 +1462,7 @@ async def vgb_generate(
         temperature:         Sampling temperature for π_ref.
         num_candidates:      K — candidates per forward step.
         num_rollouts:        MC rollouts per value estimate (mc_rollout only).
-        value_type:          "tilt" (default, no rollouts) | "mc_rollout" | "kl_regularized".
+        value_type:          "tilt" (default) | "mc_rollout" | "kl_regularized".
         tilt_alpha:          α for tilt value fn (§5.3).
         beta:                Temperature for KL-regularized setting.
         use_ground_truth_leaf: Use τ at leaves (Algorithm 1 Line 1).
@@ -1412,9 +1474,8 @@ async def vgb_generate(
         reward_regex:        Regex pattern for regex reward.
         reward_substring:    Substring for contains/not_contains reward.
         run_mode:            "practical" (run-to-leaf) | "theoretical" (fixed T, re-run).
-        step_count_T:        If >0 and run_mode="theoretical", run exactly T steps
-                             (otherwise computed from theorem).
-        delta:               Target error for theoretical mode (Theorems 4.1/4.2).
+        step_count_T:        If >0 and run_mode="theoretical", run exactly T steps.
+        delta:               Target error for theoretical mode.
         epsilon_V:           Known ε_V. If <0, attempt empirical estimation.
         error_mode:          "uniform" (Thm 4.1) | "average" (Thm 4.2).
         use_momentum:        Use VGB-Momentum (Hayes-Sinclair, Appendix E.1).
@@ -1445,14 +1506,12 @@ async def vgb_generate(
         "apply_chat_template": apply_chat_template,
         "value_model": value_model,
         "value_model_local": value_model_local,
+        # FIX 1B: persist use_momentum on the session config.
+        "use_momentum": use_momentum,
     })
 
     session = VGBSession(session_id, prompt, cfg)
-
-    if use_momentum:
-        engine: Union[VGBEngine, VGBMomentumEngine] = VGBMomentumEngine(session)
-    else:
-        engine = VGBEngine(session)
+    engine = _build_engine_for_session(session)
 
     if run_mode == "theoretical":
         eps_arg = epsilon_V if epsilon_V >= 0 else None
@@ -1469,11 +1528,16 @@ async def vgb_generate(
 
 @mcp.tool()
 async def vgb_step(session_id: str) -> str:
-    """Execute a single step of the VGB random walk for an active session."""
+    """Execute a single step of the VGB random walk for an active session.
+
+    FIX 1B: the engine is now built via _build_engine_for_session, which
+    honours `use_momentum` and reads the persisted `momentum_direction`
+    from the session — so momentum state survives across calls.
+    """
     if session_id not in SESSIONS:
         return json.dumps({"error": "Session not found."})
     session = SESSIONS[session_id]
-    engine = VGBEngine(session)
+    engine = _build_engine_for_session(session)  # FIX 1B
     action = await engine.step()
     node = session.current_node
     v = node.value_score
@@ -1483,6 +1547,8 @@ async def vgb_step(session_id: str) -> str:
         "current_depth": node.depth,
         "current_text": node.text[-200:],
         "value": round(v, 4) if v is not None else None,
+        "momentum_direction": session.momentum_direction,  # FIX 1B (visibility)
+        "use_momentum": session.config.get("use_momentum", False),
     }, indent=2)
 
 
@@ -1508,6 +1574,8 @@ async def vgb_status(session_id: str) -> str:
         "block_size": s.config.get("block_size"),
         "candidate_mode": s.config.get("candidate_mode"),
         "use_ground_truth_leaf": s.config.get("use_ground_truth_leaf"),
+        "use_momentum": s.config.get("use_momentum", False),         # FIX 1B
+        "momentum_direction": s.momentum_direction,                   # FIX 1B
         "estimated_epsilon_v": s.estimated_epsilon_v,
         "recent_history": s.history[-5:],
     }, indent=2)
@@ -1536,16 +1604,6 @@ async def verify_assumptions(
 ) -> str:
     """
     Empirically estimate ε_V and compute the theorem-required step count T.
-
-    Returns:
-      - Uniform ε_V estimate (Assumption 4.1) and T per Theorem 4.1.
-      - Average-case ε_V estimate (Assumption 4.2) and T per Theorem 4.2.
-      - Warnings if the value function appears to violate assumptions badly
-        (e.g., ε_V >> 1, suggesting catastrophic value errors as in Example 3.1).
-
-    NOTE: Finite-sample estimates cannot *certify* the assumptions hold
-    uniformly; they are diagnostics. A large empirical ε_V flags that the
-    theoretical guarantees likely do not apply.
     """
     session_id = str(uuid.uuid4())
     cfg = _default_config()
@@ -1632,9 +1690,6 @@ async def action_level_rs(
 ) -> str:
     """
     Action-Level Rejection Sampling baseline (Section 2.1, Algorithm 7).
-
-    Autoregressively samples y_h ∝ π_ref(y_h) · V̂(y_{1:h}).
-    No backtracking. Restarts from root if stuck.
     """
     session_id = str(uuid.uuid4())
     cfg = _default_config()
@@ -1684,9 +1739,6 @@ async def outcome_level_rs(
 ) -> str:
     """
     Outcome-Level Rejection Sampling baseline (Section 2.1, Algorithm 6).
-
-    Repeatedly sample full responses from π_ref, accept if τ(x,y) ≥ threshold.
-    Simple but potentially very slow (exponential in H).
     """
     session_id = str(uuid.uuid4())
     cfg = _default_config()
@@ -1738,6 +1790,7 @@ async def configure_vgb(
     reward_prompt: str = "",
     reward_regex: str = ".*",
     reward_substring: str = "",
+    use_momentum: bool = False,
 ) -> str:
     """Set default configuration for future VGB sessions (does not affect existing ones)."""
     updates = {
@@ -1765,6 +1818,7 @@ async def configure_vgb(
         "reward_prompt": reward_prompt,
         "reward_regex": reward_regex,
         "reward_substring": reward_substring,
+        "use_momentum": use_momentum,  # FIX 1B
     }
     _set_default_config(updates)
     return json.dumps({"status": "Configured", "config": _default_config()}, indent=2)
